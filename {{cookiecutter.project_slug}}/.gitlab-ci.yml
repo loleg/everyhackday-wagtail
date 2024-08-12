@@ -1,0 +1,220 @@
+include:
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
+stages:
+  - build
+  - lint
+  - test
+  - prepare
+  - release
+  - pages
+
+variables:
+  POETRY_VERSION: 1.8.3 # Make sure this matches the Dockerfile
+
+# Test if static assets can be built successfully.
+static:
+  image: node:22.4-bookworm-slim
+  stage: build
+  script:
+    - npm ci --no-optional --no-audit --progress=false
+    - npm run build:prod
+  # Saving the job result as an artifact means that the files can be used by
+  # other jobs.
+  artifacts:
+    name: "static-$CI_JOB_ID"
+    paths:
+      - ./node_modules
+      - ./{{cookiecutter.project_slug}}/static
+    expire_in: 30 mins
+
+poetry:
+  # If you update the python image version here, make sure you update all jobs that depend on this
+  # and the version in the Dockerfile and provision scripts as well
+  image: python:3.12-slim-bullseye
+  stage: build
+  script:
+    - apt-get update --yes --quiet
+    - apt-get install --yes --quiet --no-install-recommends
+      build-essential
+      libpq-dev
+      git
+    - pip install --upgrade pip
+    - pip install poetry==${POETRY_VERSION}
+    - python -m venv .venv
+    - source .venv/bin/activate
+    - poetry install --with dev,test,docs
+  artifacts:
+    name: "poetry-$CI_JOB_ID"
+    paths:
+      - ./.venv/
+    expire_in: 30 mins
+
+ruff:
+  stage: lint
+  image: python:3.12-slim-bookworm
+  dependencies:
+    - poetry
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - ruff check . --output-format=gitlab
+
+black:
+  stage: lint
+  image: python:3.12-slim-bookworm
+  dependencies:
+    - poetry
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - black . --check
+
+djlint:
+  image: python:3.12-slim-bookworm
+  stage: lint
+  dependencies:
+    - poetry
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - find {{cookiecutter.project_slug}}/ -name '*.html' -o -name '*.mjml' | xargs djlint --check
+
+stylelint:
+  stage: lint
+  image: node:22.4-bookworm-slim
+  dependencies:
+    - static
+  script:
+    - npm run lint:style
+
+eslint:
+  stage: lint
+  image: node:22.4-bookworm-slim
+  dependencies:
+    - static
+  script:
+    - npm run lint:js
+
+prettier:
+  stage: lint
+  image: node:22.4-bookworm-slim
+  dependencies:
+    - static
+  script:
+    - npm run lint:format
+
+test:
+  stage: test
+  image: python:3.12-slim-bookworm
+  services:
+    - postgis/postgis:15-3.4
+  variables:
+    POSTGRES_DB: test_postgis_db
+    POSTGRES_USER: test_postgis_user
+    POSTGRES_PASSWORD: custom_pass
+    DATABASE_URL: "postgis://test_postgis_user:custom_pass@postgis-postgis/test_postgis_db"
+    DJANGO_SECRET_KEY: secret
+    DEBUG: False
+    ALLOWED_HOSTS: ""
+    WAGTAILADMIN_BASE_URL: www.example.com
+  dependencies:
+    - static
+    - poetry
+  before_script:
+    - export DEBIAN_FRONTEND=noninteractive
+    - ln -fs /usr/share/zoneinfo/{{ cookiecutter.timezone }} /etc/localtime
+    - dpkg-reconfigure --frontend noninteractive tzdata
+    - apt-get update -y --quiet
+    - apt-get install -y --quiet --no-install-recommends
+      build-essential
+      curl
+      gdal-bin libgdal-dev binutils libproj-dev
+      git
+      libjpeg62-turbo-dev
+      libmagic1
+      libpq-dev
+      libwebp-dev
+      zlib1g-dev
+    - source .venv/bin/activate
+    - ./manage.py collectstatic --noinput --clear
+  script:
+    # Run system checks
+    - ./manage.py check
+
+    # Check for missing migrations
+    - ./manage.py makemigrations --check --noinput
+
+    # Create cache table.
+    - ./manage.py createcachetable
+
+    # Run back-end tests
+    - pytest
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+prepare:
+  stage: prepare # This stage must run before the release stage
+  image: python:3.12-slim-bookworm
+  rules:
+    - if: $CI_COMMIT_TAG
+  dependencies:
+    - poetry
+  before_script:
+    - source .venv/bin/activate
+  script:
+    - echo "TODAY=($(TZ={{ cookiecutter.timezone }} date --iso))" >> variables.env # Generate the TODAY environment variable
+    - invoke get-release-notes
+    - mv -v ../LATEST_RELEASE_NOTES.md .
+  artifacts:
+    paths:
+      - LATEST_RELEASE_NOTES.md
+    reports:
+      dotenv: variables.env
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: prepare
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG # Run this job when a tag is created
+  script:
+    - echo "Creating a Gitlab Release for $CI_COMMIT_TAG"
+  release: # See https://docs.gitlab.com/ee/ci/yaml/#release for available properties
+    name: "$CI_COMMIT_TAG $TODAY"
+    description: LATEST_RELEASE_NOTES.md
+    tag_name: "$CI_COMMIT_TAG"
+
+# https://docs.gitlab.com/ee/user/project/pages/pages_access_control.html
+pages:
+  image: python:3.12-slim-bookworm
+  stage: pages
+  variables:
+    GIT_DEPTH: 0
+  only:
+    refs:
+      - main
+    changes:
+      - docs/**/*
+      - mkdocs.yml
+  dependencies:
+    - poetry
+  before_script:
+    - apt-get update -y --quiet
+    - apt-get install -y --quiet --no-install-recommends git
+    - source .venv/bin/activate
+  script:
+    - mkdocs build
+    - cp -vr site public
+    # optionally, you can activate gzip support with the following line:
+    - find public -type f -regex '.*\.\(htm\|html\|txt\|text\|js\|css\)$' -exec gzip -f -k {} \;
+
+  artifacts:
+    paths:
+      - public

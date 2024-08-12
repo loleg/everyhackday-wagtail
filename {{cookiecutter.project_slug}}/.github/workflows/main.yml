@@ -1,0 +1,364 @@
+name: Continuous Integration
+
+# Enable Buildkit and let compose use it to speed up image building
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+  POETRY_VERSION: 1.8.3 # Make sure this matches the Dockerfile
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths-ignore: ["docs/**"]
+
+  push:
+    branches: ["main", "staging"]
+    paths-ignore: ["docs/**"]
+    tags:
+      - "v*"
+
+jobs:
+  ruff:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: {% raw %}${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}{% endraw %}
+
+      - if: steps.poetry-cache.outputs.cache-hit != 'true'
+        name: Install Poetry and Dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install poetry==$POETRY_VERSION
+          python -m venv .venv
+          source .venv/bin/activate
+          poetry install --with dev,test,docs
+
+      - name: ruff
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          ruff check . --output-format=github
+
+  black:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: {% raw %}${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}{% endraw %}
+
+      - if: steps.poetry-cache.outputs.cache-hit != 'true'
+        name: Install Poetry and Dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install poetry==$POETRY_VERSION
+          python -m venv .venv
+          source .venv/bin/activate
+          poetry install --with dev,test,docs
+
+      - name: black
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          black . --check
+
+  djlint:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: {% raw %}${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}{% endraw %}
+
+      - if: steps.poetry-cache.outputs.cache-hit != 'true'
+        name: Install Poetry and Dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install poetry==$POETRY_VERSION
+          python -m venv .venv
+          source .venv/bin/activate
+          poetry install --with dev,test,docs
+
+      - name: djlint
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          find {{cookiecutter.project_slug}}/ -name '*.html' -o -name '*.mjml' | xargs djlint --check
+
+  stylelint:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: {% raw %}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}{% endraw %}
+
+      - if: steps.node-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci --no-optional --no-audit --progress=false
+
+      - name: Stylelint
+        run: |
+          npm run lint:style
+
+  eslint:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: {% raw %}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}{% endraw %}
+
+      - if: steps.node-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci --no-optional --no-audit --progress=false
+
+      - name: ESLint
+        run: |
+          npm run lint:js
+
+  prettier:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: {% raw %}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}{% endraw %}
+
+      - if: steps.node-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci --no-optional --no-audit --progress=false
+
+      - name: Prettier
+        run: |
+          npm run lint:format
+
+  test:
+    runs-on: ubuntu-22.04
+    needs: [ruff, black, stylelint, eslint, prettier, djlint]
+
+    services:
+      postgres:
+        image: postgis/postgis:15-3.4
+        env:
+          POSTGRES_USER: test_postgres_user
+          POSTGRES_PASSWORD: custom_pass
+          POSTGRES_DB: test_postgres_db
+        # needed because the postgres container does not provide a healthcheck
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+
+    env:
+      # postgres://user:password@host:port/database
+      DATABASE_URL: "postgres://test_postgres_user:custom_pass@localhost:5432/test_postgres_db"
+      DJANGO_SECRET_KEY: "secret"
+      DEBUG: False
+      ALLOWED_HOSTS: ""
+      WAGTAILADMIN_BASE_URL: "www.example.com"
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: {% raw %}${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}{% endraw %}
+
+      - id: node-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: {% raw %}${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}{% endraw %}
+
+      - name: System Dependencies
+        shell: bash
+        run: |
+          sudo apt-get update --yes --quiet
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ={{ cookiecutter.timezone }}
+          sudo apt-get install --yes --quiet --no-install-recommends gdal-bin libgdal-dev libproj-dev libwebp-dev
+          sudo sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
+          sudo locale-gen
+          sudo ln -fs /usr/share/zoneinfo/{{ cookiecutter.timezone }} /etc/localtime
+          sudo dpkg-reconfigure tzdata
+          export LANG=en_US.UTF-8
+          export LANGUAGE=en_US:en
+          export LC_ALL=en_US.UTF-8
+
+      - if: steps.poetry-cache.outputs.cache-hit != 'true'
+        name: Install Poetry and Dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install poetry==$POETRY_VERSION
+          python -m venv .venv
+          source .venv/bin/activate
+          poetry install --with dev,test,docs
+
+      - if: steps.node-cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci --no-optional --no-audit --progress=false
+
+      - name: Static
+        shell: bash
+        run: |
+          npm run build:prod
+          source .venv/bin/activate
+          python manage.py collectstatic --noinput --clear
+
+      - name: Test with pytest
+        shell: bash
+        run: |
+          # Note that you have to activate the virtualenv in every step
+          # because GitHub actions doesn't preserve the environment
+          source .venv/bin/activate
+
+          # Run system checks
+          python manage.py check
+
+          # Check for missing migrations
+          python manage.py makemigrations --check --noinput
+
+          # Create cache table.
+          python manage.py createcachetable
+
+          # Run backend tests
+          pytest
+
+  # Creates a GitHub Release when the lint & python_tests jobs succeeds, and only on pushes to tags.
+  release:
+    needs: [ruff, black, stylelint, eslint, prettier, djlint, test]
+
+    permissions:
+      contents: write
+
+    if: needs.test.result == 'success' && startsWith( github.ref, 'refs/tags/v' )
+
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: poetry-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: {% raw %}${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}{% endraw %}
+
+      - if: steps.poetry-cache.outputs.cache-hit != 'true'
+        name: Install Poetry and Dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install poetry==$POETRY_VERSION
+          python -m venv .venv
+          source .venv/bin/activate
+          poetry install --with dev,test,docs
+
+      - name: Get the version
+        id: get_version
+        run: |{% raw %}
+          echo "${{ github.ref }}"{% endraw %}
+          echo "VERSION=$(echo $GITHUB_REF | sed 's/refs\/tags\///')" >> $GITHUB_ENV
+      - name: Generate Release Title
+        id: get_release_title
+        shell: bash
+        run: |
+          export TODAY="($(TZ={{ cookiecutter.timezone }} date --iso))"
+          echo "RELEASE_NAME=$VERSION $TODAY" >> $GITHUB_ENV
+      - name: Extract Release Notes
+        # This creates a file LATEST_RELEASE_NOTES.md in the parent directory (../)
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          invoke get-release-notes
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: {% raw %}${{ env.RELEASE_NAME }}{% endraw %}
+          body_path: ../LATEST_RELEASE_NOTES.md
